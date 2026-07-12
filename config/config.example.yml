@@ -1,0 +1,40 @@
+# B站签到助手配置示例
+
+scheduled:
+  cron: 0 1 4 1 * *
+
+browserAuth:
+  enabled: true
+  authWaitSeconds: 120
+  cdpUrl: http://127.0.0.1:9222
+  authUrl: https://www.bilibili.com
+
+msg:
+  pushType: none
+  pushConfig:
+    mailbox:
+      host: smtp.qq.com
+      port: 465
+      form: 签到系统<xxx@qq.com>
+      username: xxxxxx@qq.com
+      password: xxxxxx
+      email: receiver@example.com
+    server:
+      key: your-server-chan-key
+
+bilibili:
+  enabled: true
+  vipOnly: true
+  dryRunCharge: true
+  accounts:
+    - name: 账号1
+      profileDir: config/bilibili-profile-1
+      DEDEUSERID: xxx
+      SESSDATA: xxx
+      BILI_JCT: xxx
+      reserveCoins: 5
+      upLive: 0
+      chargeForLove: 0
+      chargeBpNum: 5
+      vipPrivilegeDays: 1
+      userAgent: ""
