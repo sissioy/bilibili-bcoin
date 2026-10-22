@@ -129,7 +129,9 @@ class BilibiliBrowserAuth:
             logger.error(f"浏览器中缺少 B站登录 Cookie: {', '.join(missing)}")
             raise AuthenticationError("浏览器中未检测到完整 B站登录态", platform="bilibili")
 
-        return {
+        normalized = dict(cookies)
+        normalized.update({
             target: cookies[source]
             for source, target in self.REQUIRED_COOKIES.items()
-        }
+        })
+        return normalized

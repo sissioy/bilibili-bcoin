@@ -30,7 +30,7 @@ def print_banner():
     print(banner)
 
 
-def main():
+def main(argv=None) -> int:
     """
     主函数
     """
@@ -53,17 +53,17 @@ def main():
     parser.add_argument('--version', '-v', action='store_true', help='显示版本信息')
     parser.add_argument('--debug', action='store_true', help='启用调试模式')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.version:
         print(f"签到助手 v{__version__}")
         print(f"作者: {__author__}")
-        return
+        return 0
 
     config_dir = Path(args.config)
     if not config_dir.exists():
         logger.error(f"配置目录不存在: {config_dir}")
-        sys.exit(1)
+        return 1
 
     log_level = "DEBUG" if args.debug else "INFO"
     setup_logger(log_dir=args.log, level=log_level)
@@ -85,7 +85,7 @@ def main():
         print(f"  跳过: {report.skipped_count}")
         print(f"  耗时: {report.duration_seconds:.2f}秒")
         print("=" * 50)
-        return
+        return 1 if report.failed_count else 0
 
     scheduler = Scheduler(config)
 
@@ -115,6 +115,8 @@ def main():
     except KeyboardInterrupt:
         scheduler.stop()
 
+    return 0
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

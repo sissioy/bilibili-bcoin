@@ -4,6 +4,7 @@ HTTP请求模块
 """
 import json
 import asyncio
+import time
 from typing import Dict, Optional, Any, Union
 from contextlib import contextmanager
 import httpx
@@ -20,6 +21,7 @@ class SyncHttpClient:
 
     _instance: Optional['SyncHttpClient'] = None
     _client: Optional[httpx.Client] = None
+    _max_get_attempts = 3
 
     def __new__(cls):
         if cls._instance is None:
@@ -75,17 +77,40 @@ class SyncHttpClient:
         Returns:
             响应对象
         """
-        try:
-            response = self.client.get(
-                url,
-                params=params,
-                headers=headers,
-                cookies=cookies
-            )
-            return response
-        except httpx.HTTPError as e:
-            logger.error(f"GET请求失败: {url}, 错误: {e}")
-            raise NetworkError(f"GET请求失败: {e}", url=url)
+        for attempt in range(self._max_get_attempts):
+            try:
+                response = self.client.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    cookies=cookies
+                )
+            except httpx.HTTPError as e:
+                if attempt + 1 == self._max_get_attempts:
+                    logger.error(f"GET请求失败: {url}, 错误: {e}")
+                    raise NetworkError(f"GET请求失败: {e}", url=url) from e
+                self._wait_before_retry(url, attempt, str(e))
+                continue
+
+            if not self._is_transient_status(response.status_code):
+                return response
+            if attempt + 1 == self._max_get_attempts:
+                logger.error(f"GET请求失败: {url}, HTTP {response.status_code}")
+                raise NetworkError(f"GET请求失败: HTTP {response.status_code}", url=url)
+            self._wait_before_retry(url, attempt, f"HTTP {response.status_code}")
+
+        raise NetworkError("GET请求失败", url=url)
+
+    def _wait_before_retry(self, url: str, attempt: int, reason: str) -> None:
+        delay = 2 ** attempt
+        logger.warning(
+            f"GET请求失败，{delay}秒后重试 "
+            f"({attempt + 1}/{self._max_get_attempts - 1}): {url}, {reason}"
+        )
+        time.sleep(delay)
+
+    def _is_transient_status(self, status_code: int) -> bool:
+        return status_code in (408, 429) or status_code >= 500
 
     def post(
         self,

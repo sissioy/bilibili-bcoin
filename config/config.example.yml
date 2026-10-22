@@ -1,7 +1,7 @@
 # B站签到助手配置示例
 
 scheduled:
-  cron: 0 1 4 1 * *
+  cron: 0 0 11 1-7 * *
 
 browserAuth:
   enabled: true

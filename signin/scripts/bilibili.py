@@ -2,6 +2,7 @@
 哔哩哔哩签到模块
 """
 import random
+import time
 from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,6 +10,12 @@ from loguru import logger
 
 from signin.core import SyncHttpClient, random_sleep, BilibiliBrowserAuth
 from signin.core.config import BilibiliAccount, BrowserAuthConfig
+from signin.core.exceptions import (
+    AuthenticationError,
+    ConfigurationError,
+    NetworkError,
+    TaskExecutionError,
+)
 from signin.core.message import MessageService
 from signin.scripts.base import BaseTask, register_task, CompositeTask
 
@@ -76,9 +83,22 @@ class BilibiliTask(CompositeTask):
 
     def check_authentication(self) -> bool:
         """检查登录状态"""
-        self._refresh_auth_from_browser()
+        browser_error = None
+        try:
+            self._refresh_auth_from_browser()
+        except (AuthenticationError, ConfigurationError) as e:
+            browser_error = e
+            logger.warning(f"浏览器登录态刷新失败，尝试使用配置中的Cookie: {e}")
+
         self.user_info = self._get_user_info()
-        return self.user_info is not None and self.user_info.mid > 0
+        if self.user_info is not None and self.user_info.mid > 0:
+            return True
+        if browser_error:
+            raise AuthenticationError(
+                "浏览器登录态刷新失败，且配置中的Cookie无效",
+                platform=self.platform,
+            ) from browser_error
+        return False
 
     def execute(self) -> Dict[str, Any]:
         """执行签到任务"""
@@ -89,7 +109,6 @@ class BilibiliTask(CompositeTask):
     def on_error(self, error: Exception) -> None:
         """错误处理"""
         super().on_error(error)
-        from signin.core.exceptions import AuthenticationError
         if isinstance(error, AuthenticationError) and self.message_service:
             self.message_service.notify_cookie_expired("哔哩哔哩", self.account_name)
 
@@ -107,11 +126,13 @@ class BilibiliTask(CompositeTask):
         self.account.DEDEUSERID = cookies["DEDEUSERID"]
         self.account.SESSDATA = cookies["SESSDATA"]
         self.account.BILI_JCT = cookies["BILI_JCT"]
-        self._sync_cookie_dict()
+        self._sync_cookie_dict(cookies)
         logger.info(f"已从{source}刷新 B站登录态")
 
-    def _sync_cookie_dict(self) -> None:
+    def _sync_cookie_dict(self, browser_cookies: Optional[Dict[str, str]] = None) -> None:
         self.cookies.clear()
+        if browser_cookies:
+            self.cookies.update(browser_cookies)
         if self.account.DEDEUSERID:
             self.cookies["DEDEUSERID"] = self.account.DEDEUSERID
             self.cookies["DedeUserID"] = self.account.DEDEUSERID
@@ -137,7 +158,13 @@ class BilibiliTask(CompositeTask):
                 vip_type=info.get('vipType', 0),
                 vip_status=info.get('vipStatus', 0),
             )
-        return None
+        if data.get('code') == 0 or data.get('code') == -101:
+            return None
+        raise TaskExecutionError(
+            f"获取用户信息失败: {data.get('message') or data.get('msg') or data.get('code')}",
+            task_name=self.task_name,
+            account_name=self.account_name,
+        )
 
     def _get_daily_task_status(self) -> Dict[str, Any]:
         """获取每日任务状态"""
@@ -469,16 +496,9 @@ class BilibiliVipPrivilegeTask(BilibiliSubTask):
     """领取大会员权益并使用B币券充电"""
 
     task_name = "bilibili_vip_privilege"
-
-    PRIVILEGE_TYPES = {
-        1: "B币券",
-        2: "会员购优惠券",
-        3: "漫画福利券",
-        4: "会员购包邮券",
-        5: "漫画商城优惠券",
-        6: "装扮体验卡",
-        7: "课堂优惠券",
-    }
+    BCOIN_PRIVILEGE_TYPE = 1
+    POST_ATTEMPTS = 3
+    BALANCE_POLL_DELAYS = (0, 2, 4, 8)
 
     def check_authentication(self) -> bool:
         return True
@@ -492,54 +512,78 @@ class BilibiliVipPrivilegeTask(BilibiliSubTask):
             logger.info("非有效大会员，跳过领取权益")
             return {"success": False, "skipped": True, "reason": "非有效大会员"}
 
-        day = datetime.now().day
-        vip_days = max(1, self.account.vipPrivilegeDays)
-        if day > vip_days:
-            logger.info(f"当前为本月 {day} 日，非月初权益处理窗口，跳过")
-            return {"success": True, "skipped": True, "reason": "非月初权益处理窗口"}
+        status = self._get_bcoin_privilege()
+        if status is None:
+            return {"success": False, "reason": "获取B币券领取周期失败"}
+        next_receive_time = status.get("period_end_unix")
+        logger.info(f"B币券领取周期结束时间: {next_receive_time}")
+        if status.get("state") == 1:
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "本周期B币券已领取，不重复充电",
+                "next_receive_time": next_receive_time,
+            }
+        if status.get("state") != 0:
+            return {"success": False, "reason": "B币券领取状态不明"}
 
-        privileges = {}
-        for privilege_type, name in self.PRIVILEGE_TYPES.items():
-            result = self._receive_privilege(privilege_type)
-            privileges[name] = result
-            code = result.get("code")
-            if code == 0:
-                logger.info(f"领取{name}成功")
-            elif code == 69801:
-                logger.info(f"{name}已领取")
-            else:
-                logger.warning(f"领取{name}失败: {result.get('message') or result.get('msg')}")
-            random_sleep(300, 1000)
+        privilege = self._receive_privilege(self.BCOIN_PRIVILEGE_TYPE)
+        code = privilege.get("code")
+        if code == 0:
+            logger.info("领取B币券成功")
+        elif code == 69801:
+            logger.info("B币券已领取")
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "本周期B币券已领取，不重复充电",
+                "next_receive_time": next_receive_time,
+            }
+        else:
+            logger.warning(f"领取B币券失败: {privilege.get('message') or privilege.get('msg')}")
+            return {
+                "success": False,
+                "reason": "领取B币券失败",
+                "privilege": privilege,
+            }
 
         charge_result = self._charge_with_bcoin_coupon()
-        privileges_succeeded = all(
-            result.get("code") in (0, 69801)
-            for result in privileges.values()
-        )
-        charge_succeeded = charge_result.get("success") is True or charge_result.get("skipped") is True
+        charge_succeeded = charge_result.get("success") is True
 
         return {
-            "success": privileges_succeeded and charge_succeeded,
-            "privileges": privileges,
+            "success": charge_succeeded,
+            "privilege": privilege,
             "charge": charge_result,
+            "next_receive_time": next_receive_time,
         }
+
+    def _get_bcoin_privilege(self):
+        response = self.http.get(
+            "https://api.bilibili.com/x/vip/privilege/my",
+            headers=self.headers,
+            cookies=self.cookies,
+        )
+        result = response.json()
+        if result.get("code") == 0:
+            for privilege in result.get("data", {}).get("list", []):
+                if privilege.get("type") == self.BCOIN_PRIVILEGE_TYPE:
+                    return privilege
+        return None
 
     def _receive_privilege(self, privilege_type: int) -> Dict[str, Any]:
         url = "https://api.bilibili.com/x/vip/privilege/receive"
         data = {"type": privilege_type, "csrf": self.account.BILI_JCT}
-        try:
-            response = self.http.post(url, data=data, headers=self.headers, cookies=self.cookies)
-            return response.json()
-        except Exception as e:
-            return {"code": -1, "message": str(e)}
+        return self._post_json_with_retry(url, data=data)
 
     def _charge_with_bcoin_coupon(self) -> Dict[str, Any]:
         if self.account.chargeForLove == "0":
             logger.info("未配置充电对象UID，跳过B币券充电")
             return {"success": False, "skipped": True, "reason": "未配置充电对象UID"}
 
-        coupon_balance = self._get_coupon_balance()
         charge_bp_num = self.account.chargeBpNum
+        coupon_balance = self._poll_coupon_balance(
+            lambda balance: balance >= charge_bp_num,
+        )
         if coupon_balance is None:
             return {"success": False, "reason": "获取B币券余额失败"}
         if int(coupon_balance) < charge_bp_num:
@@ -558,26 +602,56 @@ class BilibiliVipPrivilegeTask(BilibiliSubTask):
                 "dry_run": True,
                 "target_uid": self.account.chargeForLove,
                 "bp_num": charge_bp_num,
-                "coupon_balance": coupon_balance,
+                "coupon_balance_before": coupon_balance,
             }
 
         result = self._charge_user(self.account.chargeForLove, charge_bp_num)
-        data = result.get("data", {})
-        success = result.get("code") == 0 and data.get("status") == 4
-        if success:
-            logger.info(f"检测到B币券余额后，已给 UID {self.account.chargeForLove} 充电 {charge_bp_num} 贝壳")
+        if result.get("code") == -2:
+            return {"success": False, "reason": result["message"], "response": result}
+        balance_after = self._poll_coupon_balance(
+            lambda balance: coupon_balance - balance >= charge_bp_num,
+        )
+        balance_confirmed = (
+            balance_after is not None
+            and coupon_balance - balance_after >= charge_bp_num
+        )
+        response_data = result.get("data") or {}
+        response_succeeded = result.get("code") == 0 and response_data.get("status") == 4
+
+        if balance_confirmed:
+            logger.info(
+                f"B币券余额已扣减，已给 UID {self.account.chargeForLove} "
+                f"充电 {charge_bp_num} 贝壳"
+            )
+        elif result.get("code") == -1 or response_succeeded:
+            logger.warning("充电响应或余额状态不明确，本次不再提交充电请求")
         else:
-            logger.warning(f"B币券充电失败: {data.get('msg') or result.get('message')}")
+            logger.warning(f"B币券充电失败: {response_data.get('msg') or result.get('message')}")
 
         return {
-            "success": success,
+            "success": balance_confirmed,
+            "uncertain": not balance_confirmed and (
+                result.get("code") == -1 or response_succeeded
+            ),
+            "reason": None if balance_confirmed else (
+                "充电状态不明"
+                if result.get("code") == -1 or response_succeeded
+                else "B币券充电失败"
+            ),
             "target_uid": self.account.chargeForLove,
             "bp_num": charge_bp_num,
-            "coupon_balance": coupon_balance,
+            "coupon_balance_before": coupon_balance,
+            "coupon_balance_after": balance_after,
             "response": result,
         }
 
     def _get_coupon_balance(self) -> Optional[float]:
+        wallet = self._get_wallet()
+        if wallet is not None and "couponBalance" in wallet:
+            return float(wallet["couponBalance"])
+        return None
+
+    def _get_wallet(self):
         url = "https://pay.bilibili.com/paywallet/wallet/getUserWallet"
         now_ms = int(datetime.now().timestamp() * 1000)
         data = {
@@ -586,17 +660,77 @@ class BilibiliVipPrivilegeTask(BilibiliSubTask):
             "traceId": now_ms,
             "version": "1.0",
         }
-        try:
-            response = self.http.post(url, json_data=data, headers=self.headers, cookies=self.cookies)
-            result = response.json()
-            if result.get("code") == 0:
-                return float(result.get("data", {}).get("couponBalance", 0))
-            logger.warning(f"获取B币券余额失败: {result.get('message') or result.get('msg')}")
-        except Exception as e:
-            logger.warning(f"获取B币券余额失败: {e}")
+        result = self._post_json_with_retry(url, json_data=data)
+        if result.get("code") == 0:
+            return result.get("data")
+        logger.warning(f"获取B币券余额失败: {result.get('message') or result.get('msg')}")
         return None
 
+    def _poll_coupon_balance(self, predicate) -> Optional[float]:
+        last_balance = None
+        for delay in self.BALANCE_POLL_DELAYS:
+            if delay:
+                time.sleep(delay)
+            balance = self._get_coupon_balance()
+            if balance is None:
+                return None
+            last_balance = balance
+            if predicate(balance):
+                return balance
+        return last_balance
+
+    def _post_json_with_retry(
+        self,
+        url: str,
+        data: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        for attempt in range(self.POST_ATTEMPTS):
+            try:
+                response = self.http.post(
+                    url,
+                    data=data,
+                    json_data=json_data,
+                    headers=self.headers,
+                    cookies=self.cookies,
+                )
+            except NetworkError as e:
+                if attempt + 1 == self.POST_ATTEMPTS:
+                    return {"code": -1, "message": str(e)}
+                self._wait_before_post_retry(attempt, str(e))
+                continue
+
+            if response.status_code not in (408, 429) and response.status_code < 500:
+                try:
+                    return response.json()
+                except ValueError as e:
+                    return {"code": -1, "message": str(e)}
+            if attempt + 1 == self.POST_ATTEMPTS:
+                return {"code": -1, "message": f"HTTP {response.status_code}"}
+            self._wait_before_post_retry(attempt, f"HTTP {response.status_code}")
+
+        return {"code": -1, "message": "请求失败"}
+
+    def _wait_before_post_retry(self, attempt: int, reason: str) -> None:
+        delay = 2 ** attempt
+        logger.warning(
+            f"B币券安全请求失败，{delay}秒后重试 "
+            f"({attempt + 1}/{self.POST_ATTEMPTS - 1}): {reason}"
+        )
+        time.sleep(delay)
+
     def _charge_user(self, uid: str, bp_num: int) -> Dict[str, Any]:
+        wallet = self._get_wallet()
+        if (
+            not wallet
+            or any(type(wallet.get(key)) not in (int, float)
+                   for key in ("couponBalance", "defaultBp", "iosBp"))
+            or not wallet["couponBalance"] >= bp_num
+            or wallet["defaultBp"] != 0
+            or wallet["iosBp"] != 0
+        ):
+            logger.warning("无法保证只使用B币券，已阻止充电提交")
+            return {"code": -2, "message": "只用B币券检查未通过，未提交充电", "data": {}}
         url = "https://api.bilibili.com/x/ugcpay/web/v2/trade/elec/pay/quick"
         data = {
             "bp_num": bp_num,

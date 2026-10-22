@@ -197,3 +197,9 @@ class MessageService:
         title = f"【签到助手】{platform}账号Cookie失效通知"
         message = f"您的{platform}账号【{account_name}】Cookie已失效，请及时更新配置。"
         self.send(title, message)
+
+    def notify_task_failed(self, platform: str, account_name: str, details: str):
+        """通知任务最终失败"""
+        title = f"【签到助手】{platform}任务失败"
+        message = f"账号: {account_name}\n详情: {details}"
+        self.send(title, message)

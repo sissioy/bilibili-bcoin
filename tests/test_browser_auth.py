@@ -96,6 +96,7 @@ class BilibiliBrowserAuthTest(unittest.TestCase):
             "DedeUserID": "new-mid",
             "SESSDATA": "new-sess",
             "bili_jct": "new-jct",
+            "buvid3": "browser-fingerprint",
         }
         context = FakeContext(old_cookies, cookies_after_goto=new_cookies)
 
@@ -111,6 +112,9 @@ class BilibiliBrowserAuthTest(unittest.TestCase):
         self.assertEqual(
             result,
             {
+                "DedeUserID": "new-mid",
+                "bili_jct": "new-jct",
+                "buvid3": "browser-fingerprint",
                 "DEDEUSERID": "new-mid",
                 "SESSDATA": "new-sess",
                 "BILI_JCT": "new-jct",

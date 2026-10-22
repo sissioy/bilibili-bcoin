@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from signin.core.config import BilibiliAccount, BrowserAuthConfig, BilibiliConfig, Config
 from signin.scheduler.executor import TaskExecutor
@@ -90,6 +90,16 @@ class TaskExecutorTest(unittest.TestCase):
 
         self.assertEqual(result.status, TaskStatus.FAILED)
         self.assertEqual(result.data["failed"], 1)
+
+    def test_failed_task_sends_notification(self):
+        executor = TaskExecutor(Config())
+        executor.message_service = Mock()
+        task = ResultTask({"success": False, "reason": "network unavailable"})
+
+        with patch.object(executor, "load_tasks", side_effect=lambda: executor._tasks.append(task)):
+            executor.run_all()
+
+        executor.message_service.notify_task_failed.assert_called_once()
 
 
 if __name__ == "__main__":

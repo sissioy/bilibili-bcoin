@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from loguru import logger
 
-from signin.core import Config, load_config, MessageService
+from signin.core import AuthenticationError, Config, load_config, MessageService
 from signin.scripts.base import BaseTask, TaskResult, TaskStatus, TaskRegistry
 from signin.scripts.bilibili import BilibiliTask
 
@@ -130,6 +130,7 @@ class TaskExecutor:
                     report.success_count += 1
                 elif result.status == TaskStatus.FAILED:
                     report.failed_count += 1
+                    self._notify_failure(result)
                 elif result.status == TaskStatus.SKIPPED:
                     report.skipped_count += 1
 
@@ -144,6 +145,31 @@ class TaskExecutor:
         )
 
         return report
+
+    def _notify_failure(self, result: TaskResult) -> None:
+        if isinstance(result.error, AuthenticationError):
+            return
+
+        details = result.message
+        for child in result.data.get("results", []):
+            if child.get("status") != TaskStatus.FAILED.value:
+                continue
+            child_data = child.get("data") or {}
+            charge = child_data.get("charge") or {}
+            details = (
+                charge.get("reason")
+                or child_data.get("reason")
+                or child.get("error")
+                or child.get("message")
+                or details
+            )
+            break
+
+        self.message_service.notify_task_failed(
+            "哔哩哔哩",
+            result.account_name,
+            details,
+        )
 
     def _run_task(self, task: BaseTask) -> TaskResult:
         """
